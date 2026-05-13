@@ -231,6 +231,76 @@ async fn tail(
     Ok(Json(json!({ "db": db, "collection": coll, "count": count, "documents": docs })))
 }
 
+// ── POST /find and POST /tail ─────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct FindBody {
+    #[serde(rename = "where")]
+    filter: Option<Value>,
+    #[serde(default = "default_n")]
+    n: usize,
+    #[serde(default)]
+    offset: usize,
+}
+
+#[derive(Deserialize)]
+struct TailBody {
+    #[serde(rename = "where")]
+    filter: Option<Value>,
+    #[serde(default = "default_n")]
+    n: usize,
+}
+
+fn body_filter(v: Option<Value>) -> Result<Option<HashMap<String, Value>>, (StatusCode, Json<Value>)> {
+    match v {
+        None => Ok(None),
+        Some(Value::Object(m)) if m.is_empty() => Ok(None),
+        Some(Value::Object(m)) => Ok(Some(m.into_iter().collect())),
+        Some(_) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "'where' must be a JSON object" })),
+        )),
+    }
+}
+
+async fn find_post(
+    State(eng): State<AppState>,
+    Path((db, coll)): Path<(String, String)>,
+    Json(body): Json<FindBody>,
+) -> Result<Json<Value>, Response> {
+    if body.n == 0 || body.n > 100_000 {
+        return Ok(Json(json!({ "error": "n must be 1–100000" })));
+    }
+    let filter = body_filter(body.filter).map_err(IntoResponse::into_response)?;
+    let (db2, coll2) = (db.clone(), coll.clone());
+    let (n, offset)  = (body.n, body.offset);
+    let docs = task::spawn_blocking(move || eng.find(&db2, &coll2, n, offset, filter.as_ref()))
+        .await
+        .unwrap()
+        .map_err(|e| AppError(e).into_response())?;
+    let count = docs.len();
+    Ok(Json(json!({ "db": db, "collection": coll, "offset": offset, "count": count, "documents": docs })))
+}
+
+async fn tail_post(
+    State(eng): State<AppState>,
+    Path((db, coll)): Path<(String, String)>,
+    Json(body): Json<TailBody>,
+) -> Result<Json<Value>, Response> {
+    if body.n == 0 || body.n > 100_000 {
+        return Ok(Json(json!({ "error": "n must be 1–100000" })));
+    }
+    let filter = body_filter(body.filter).map_err(IntoResponse::into_response)?;
+    let (db2, coll2) = (db.clone(), coll.clone());
+    let n = body.n;
+    let docs = task::spawn_blocking(move || eng.tail(&db2, &coll2, n, filter.as_ref()))
+        .await
+        .unwrap()
+        .map_err(|e| AppError(e).into_response())?;
+    let count = docs.len();
+    Ok(Json(json!({ "db": db, "collection": coll, "count": count, "documents": docs })))
+}
+
 async fn stats(
     State(eng): State<AppState>,
     Path((db, coll)): Path<(String, String)>,
@@ -335,8 +405,8 @@ async fn main() {
             .route("/v1/:db",                get(list_collections).delete(drop_database))
             .route("/v1/:db/:coll",          post(insert_one).delete(drop_collection))
             .route("/v1/:db/:coll/batch",    post(insert_many))
-            .route("/v1/:db/:coll/find",     get(find))
-            .route("/v1/:db/:coll/tail",     get(tail))
+            .route("/v1/:db/:coll/find",     get(find).post(find_post))
+            .route("/v1/:db/:coll/tail",     get(tail).post(tail_post))
             .route("/v1/:db/:coll/stats",    get(stats))
             .route("/v1/:db/:coll/index",        post(create_index))
             .route("/v1/:db/:coll/indexes",      get(list_indexes))
