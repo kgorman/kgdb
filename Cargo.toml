@@ -1,0 +1,25 @@
+[package]
+name    = "kgdb"
+version = "1.0.0"
+edition = "2021"
+
+[[bin]]
+name = "kgdb"
+path = "src/main.rs"
+
+[dependencies]
+axum          = "0.7"
+tokio         = { version = "1", features = ["full"] }
+serde         = { version = "1", features = ["derive"] }
+serde_json    = "1"
+dashmap       = "5"
+thiserror     = "1"
+rand          = "0.8"
+tracing       = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+memchr        = "2"     # fast newline counting
+
+[profile.release]
+opt-level     = 3
+lto           = "thin"
+codegen-units = 1
