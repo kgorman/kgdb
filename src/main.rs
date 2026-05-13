@@ -269,48 +269,61 @@ async fn tail(
 }
 
 // ── POST /find and POST /tail ─────────────────────────────────────────────────
+//
+// MongoDB-style: the body is a flat JSON object. Reserved keys `n` and `offset`
+// are control parameters; every other key is an implicit filter field.
+//
+//   POST /find   {"role":"admin","n":50,"offset":0}
+//   POST /tail   {"level":"error","n":100}
 
-#[derive(Deserialize)]
-struct FindBody {
-    #[serde(rename = "where")]
-    filter: Option<Value>,
-    #[serde(default = "default_n")]
-    n: usize,
-    #[serde(default)]
+struct PostQuery {
+    filter: Option<HashMap<String, Value>>,
+    n:      usize,
     offset: usize,
 }
 
-#[derive(Deserialize)]
-struct TailBody {
-    #[serde(rename = "where")]
-    filter: Option<Value>,
-    #[serde(default = "default_n")]
-    n: usize,
-}
+/// Extract control params (n, offset) from a flat object; remainder is the filter.
+fn parse_post_body(body: Value) -> Result<PostQuery, (StatusCode, Json<Value>)> {
+    let Value::Object(mut map) = body else {
+        return Err((StatusCode::BAD_REQUEST, Json(json!({ "error": "body must be a JSON object" }))));
+    };
 
-fn body_filter(v: Option<Value>) -> Result<Option<HashMap<String, Value>>, (StatusCode, Json<Value>)> {
-    match v {
-        None => Ok(None),
-        Some(Value::Object(m)) if m.is_empty() => Ok(None),
-        Some(Value::Object(m)) => Ok(Some(m.into_iter().collect())),
-        Some(_) => Err((
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "'where' must be a JSON object" })),
-        )),
-    }
+    let n = match map.remove("n") {
+        None => default_n(),
+        Some(Value::Number(num)) => num.as_u64()
+            .map(|v| v as usize)
+            .ok_or_else(|| (StatusCode::BAD_REQUEST, Json(json!({ "error": "n must be a positive integer" }))))?,
+        Some(_) => return Err((StatusCode::BAD_REQUEST, Json(json!({ "error": "n must be a positive integer" })))),
+    };
+
+    let offset = match map.remove("offset") {
+        None => 0,
+        Some(Value::Number(num)) => num.as_u64()
+            .map(|v| v as usize)
+            .ok_or_else(|| (StatusCode::BAD_REQUEST, Json(json!({ "error": "offset must be a non-negative integer" }))))?,
+        Some(_) => return Err((StatusCode::BAD_REQUEST, Json(json!({ "error": "offset must be a non-negative integer" })))),
+    };
+
+    let filter = if map.is_empty() {
+        None
+    } else {
+        Some(map.into_iter().collect())
+    };
+
+    Ok(PostQuery { filter, n, offset })
 }
 
 async fn find_post(
     State(eng): State<AppState>,
     Path((db, coll)): Path<(String, String)>,
-    Json(body): Json<FindBody>,
+    Json(body): Json<Value>,
 ) -> Result<Json<Value>, Response> {
-    if body.n == 0 || body.n > 100_000 {
+    let q = parse_post_body(body).map_err(IntoResponse::into_response)?;
+    if q.n == 0 || q.n > 100_000 {
         return Ok(Json(json!({ "error": "n must be 1–100000" })));
     }
-    let filter = body_filter(body.filter).map_err(IntoResponse::into_response)?;
     let (db2, coll2) = (db.clone(), coll.clone());
-    let (n, offset)  = (body.n, body.offset);
+    let (n, offset, filter) = (q.n, q.offset, q.filter);
     let docs = task::spawn_blocking(move || eng.find(&db2, &coll2, n, offset, filter.as_ref()))
         .await
         .unwrap()
@@ -322,14 +335,14 @@ async fn find_post(
 async fn tail_post(
     State(eng): State<AppState>,
     Path((db, coll)): Path<(String, String)>,
-    Json(body): Json<TailBody>,
+    Json(body): Json<Value>,
 ) -> Result<Json<Value>, Response> {
-    if body.n == 0 || body.n > 100_000 {
+    let q = parse_post_body(body).map_err(IntoResponse::into_response)?;
+    if q.n == 0 || q.n > 100_000 {
         return Ok(Json(json!({ "error": "n must be 1–100000" })));
     }
-    let filter = body_filter(body.filter).map_err(IntoResponse::into_response)?;
     let (db2, coll2) = (db.clone(), coll.clone());
-    let n = body.n;
+    let (n, filter) = (q.n, q.filter);
     let docs = task::spawn_blocking(move || eng.tail(&db2, &coll2, n, filter.as_ref()))
         .await
         .unwrap()

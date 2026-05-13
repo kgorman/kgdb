@@ -175,30 +175,19 @@ Database and collection names: alphanumeric, `_`, `-`, max 128 chars.
 | `offset` | `0` | Documents to skip — `/find` only |
 | `where` | — | JSON field equality filter: `{"field":"value"}` |
 
-#### POST `/find` — JSON body
+#### POST `/find` and POST `/tail` — JSON body
 
-Send the filter as a JSON document instead of URL-encoding it. Useful for complex filters, scripting, and saving queries to files.
+MongoDB-style: send a flat JSON object. `n` and `offset` are reserved control fields; every other key is an implicit filter field. No wrapper key needed.
 
 ```json
-{ "filter": {"status": "active", "role": "admin"}, "n": 50, "offset": 0 }
+{ "role": "admin", "status": "active", "n": 50, "offset": 0 }
 ```
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `filter` | — | JSON object — field equality filter |
 | `n` | `20` | Documents to return (1–100,000) |
-| `offset` | `0` | Documents to skip |
-
-#### POST `/tail` — JSON body
-
-```json
-{ "filter": {"level": "error"}, "n": 100 }
-```
-
-| Field | Default | Description |
-|-------|---------|-------------|
-| `filter` | — | JSON object — field equality filter |
-| `n` | `20` | Documents from the end (1–100,000) |
+| `offset` | `0` | Documents to skip — `/find` only |
+| _(any other key)_ | — | Implicit filter — equality match on that field |
 
 ### Indexes
 
@@ -246,13 +235,13 @@ curl -X POST http://localhost:8000/v1/mydb/users/batch \
 # Filter by field value (GET — URL-encoded)
 curl -g 'http://localhost:8000/v1/mydb/users/find?where={"role":"admin"}'
 
-# Filter by field value (POST — JSON body, no URL-encoding needed)
+# Filter by field value (POST — flat body, MongoDB-style, no URL-encoding)
 curl -X POST http://localhost:8000/v1/mydb/users/find \
   -H 'Content-Type: application/json' \
-  -d '{"filter":{"role":"admin"},"n":50}'
+  -d '{"role":"admin","n":50}'
 
 # Save a query to a file and reuse it
-echo '{"filter":{"status":"active","role":"admin"},"n":100}' > query.json
+echo '{"status":"active","role":"admin","n":100}' > query.json
 curl -X POST http://localhost:8000/v1/mydb/users/find \
   -H 'Content-Type: application/json' -d @query.json
 
@@ -262,10 +251,10 @@ curl 'http://localhost:8000/v1/mydb/users/find?n=20&offset=40'
 # Last 10 documents
 curl 'http://localhost:8000/v1/mydb/users/tail?n=10'
 
-# Last 100 error-level events (POST)
+# Last 100 error-level events (POST — flat body)
 curl -X POST http://localhost:8000/v1/mydb/events/tail \
   -H 'Content-Type: application/json' \
-  -d '{"filter":{"level":"error"},"n":100}'
+  -d '{"level":"error","n":100}'
 
 # Stats
 curl http://localhost:8000/v1/mydb/users/stats
