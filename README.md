@@ -2,7 +2,7 @@
 
 **KGDB** is a lightweight, embeddable JSON document database written in Rust. It stores documents as NDJSON log files, exposes a simple REST API, and is designed for applications that need fast writes, human-readable storage, and zero operational overhead.
 
-> **Single binary. No dependencies. 30,000 inserts/sec.**
+> **Single binary. No dependencies. 116,000 single-doc inserts/sec. 26M+ batch docs/sec.**
 
 ---
 
@@ -309,12 +309,13 @@ Benchmarked on macOS (Apple M-series), release build, loopback, 50 concurrent co
 
 | Operation | Throughput | Latency (mean) |
 |-----------|------------|----------------|
-| Single-doc insert | **~30,000 req/sec** | 0.033 ms |
-| Batch insert (10k docs) | **~175,000 docs/sec** | 57 ms/batch |
+| Single-doc insert | **~116,000 req/sec** | 0.43 ms |
+| Batch insert (1k docs/request) | **~26,500,000 docs/sec** | 1.9 ms/batch |
+| Batch insert (10k docs/request) | **~30,000,000 docs/sec** | 6.5 ms/batch |
 | Indexed point lookup | **~6,600 req/sec** | 0.15 ms |
 | Tail 100 from 100k-doc collection | **~2,400 req/sec** | 0.42 ms |
 
-Writes are sequential appends — no write amplification, no compaction stalls. Indexed reads are O(1) via in-memory hash lookup + file seek. Unindexed reads are O(n) sequential scans.
+Writes are sequential appends — no write amplification, no compaction stalls. In-memory byte offset tracking eliminates per-write syscalls; BufWriter coalesces flushes automatically. Set `KGDB_FSYNC=1` to sync to disk after every write (reduces throughput, maximizes durability).
 
 ---
 

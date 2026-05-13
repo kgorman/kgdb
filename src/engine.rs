@@ -57,7 +57,13 @@ pub enum EngineError {
 
 // ── engine ────────────────────────────────────────────────────────────────────
 
-type Handle = Arc<Mutex<BufWriter<File>>>;
+/// Writer state: BufWriter + in-memory byte offset (avoids flush+stat per write).
+struct WriterState {
+    writer: BufWriter<File>,
+    offset: u64,
+}
+
+type Handle = Arc<Mutex<WriterState>>;
 
 /// field_name -> value_as_json_string -> sorted Vec<byte_offset>
 type FieldIndex = DashMap<String, Vec<u64>>;
@@ -66,15 +72,16 @@ type CollIndexes = DashMap<String, FieldIndex>;
 
 pub struct Engine {
     root:    PathBuf,
+    fsync:   bool,
     handles: DashMap<(String, String), Handle>,
     indexes: DashMap<(String, String), CollIndexes>,
 }
 
 impl Engine {
-    pub fn new(root: impl Into<PathBuf>) -> io::Result<Self> {
+    pub fn new(root: impl Into<PathBuf>, fsync: bool) -> io::Result<Self> {
         let root = root.into();
         fs::create_dir_all(&root)?;
-        let eng = Self { root, handles: DashMap::new(), indexes: DashMap::new() };
+        let eng = Self { root, fsync, handles: DashMap::new(), indexes: DashMap::new() };
         eng.rebuild_indexes()?;
         Ok(eng)
     }
@@ -187,7 +194,9 @@ impl Engine {
         let path = self.coll_path(db, coll)?;
         let entry = self.handles.entry(key).or_try_insert_with(|| {
             let file = OpenOptions::new().create(true).append(true).open(&path)?;
-            Ok::<Handle, EngineError>(Arc::new(Mutex::new(BufWriter::with_capacity(WRITE_BUF, file))))
+            let offset = file.metadata()?.len();
+            let state = WriterState { writer: BufWriter::with_capacity(WRITE_BUF, file), offset };
+            Ok::<Handle, EngineError>(Arc::new(Mutex::new(state)))
         })?;
         Ok(Arc::clone(&*entry))
     }
@@ -209,16 +218,17 @@ impl Engine {
     // ── writes ────────────────────────────────────────────────────────────────
 
     pub fn insert(&self, db: &str, coll: &str, doc: Value) -> Result<String, EngineError> {
-        let (id, line) = annotate(doc)?;
+        let (id, line, annotated_doc) = annotate(doc)?;
         let handle = self.get_handle(db, coll)?;
-        let mut w = handle.lock().unwrap_or_else(|e| e.into_inner());
-        w.flush()?;
-        let offset = w.get_ref().metadata()?.len();
-        w.write_all(line.as_bytes())?;
-        w.flush()?;
-        // Re-parse the annotated line for index updating
-        let annotated_doc: Value = serde_json::from_str(line.trim_end_matches('\n'))?;
-        drop(w);
+        let mut st = handle.lock().unwrap_or_else(|e| e.into_inner());
+        let offset = st.offset;
+        st.writer.write_all(line.as_bytes())?;
+        st.offset += line.len() as u64;
+        if self.fsync {
+            st.writer.flush()?;
+            st.writer.get_ref().sync_data()?;
+        }
+        drop(st);
         self.update_indexes_for_doc(db, coll, &annotated_doc, offset);
         Ok(id)
     }
@@ -234,8 +244,7 @@ impl Engine {
 
         for doc in docs {
             let rel_offset = blob.len() as u64;
-            let (id, line) = annotate(doc)?;
-            let annotated_doc: Value = serde_json::from_str(line.trim_end_matches('\n'))?;
+            let (id, line, annotated_doc) = annotate(doc)?;
             blob.extend_from_slice(line.as_bytes());
             if blob.len() > MAX_BATCH {
                 return Err(EngineError::BatchTooLarge);
@@ -245,12 +254,15 @@ impl Engine {
         }
 
         let handle = self.get_handle(db, coll)?;
-        let mut w = handle.lock().unwrap_or_else(|e| e.into_inner());
-        w.flush()?;
-        let base = w.get_ref().metadata()?.len();
-        w.write_all(&blob)?;
-        w.flush()?;
-        drop(w);
+        let mut st = handle.lock().unwrap_or_else(|e| e.into_inner());
+        let base = st.offset;
+        st.writer.write_all(&blob)?;
+        st.offset += blob.len() as u64;
+        if self.fsync {
+            st.writer.flush()?;
+            st.writer.get_ref().sync_data()?;
+        }
+        drop(st);
 
         for (doc, rel_offset) in doc_offsets {
             self.update_indexes_for_doc(db, coll, &doc, base + rel_offset);
@@ -450,7 +462,7 @@ impl Engine {
     pub fn drop_collection(&self, db: &str, coll: &str) -> Result<bool, EngineError> {
         let key = (db.to_owned(), coll.to_owned());
         if let Some((_, h)) = self.handles.remove(&key) {
-            let _ = h.lock().unwrap_or_else(|e| e.into_inner()).flush();
+            let _ = h.lock().unwrap_or_else(|e| e.into_inner()).writer.flush();
         }
         self.indexes.remove(&key);
         let sidecar = self.sidecar_path(db, coll);
@@ -477,7 +489,7 @@ impl Engine {
         };
         self.handles.retain(|(d, _), h| {
             if d == db {
-                let _ = h.lock().unwrap_or_else(|e| e.into_inner()).flush();
+                let _ = h.lock().unwrap_or_else(|e| e.into_inner()).writer.flush();
                 false
             } else {
                 true
@@ -522,7 +534,9 @@ pub fn validate_name(name: &str) -> Result<(), EngineError> {
     Ok(())
 }
 
-fn annotate(mut doc: Value) -> Result<(String, String), EngineError> {
+/// Returns (id, ndjson_line, annotated_value).
+/// Returning the Value avoids a re-parse in callers that need it for index updates.
+fn annotate(mut doc: Value) -> Result<(String, String, Value), EngineError> {
     let id = new_id();
     // _ts stored as string to preserve nanosecond precision past JSON's 2^53 safe integer limit
     let ts = SystemTime::now()
@@ -537,7 +551,7 @@ fn annotate(mut doc: Value) -> Result<(String, String), EngineError> {
     let mut s = serde_json::to_string(&doc)?;
     if s.len() > MAX_DOC { return Err(EngineError::TooLarge); }
     s.push('\n');
-    Ok((id, s))
+    Ok((id, s, doc))
 }
 
 /// Build a FieldIndex for the given field by scanning the NDJSON file line by line,

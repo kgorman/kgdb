@@ -458,7 +458,10 @@ async fn main() {
         tracing::info!("auth: per-db token enabled for database '{db_name}'");
     }
 
-    let engine = Arc::new(Engine::new(&data_dir).expect("failed to initialise engine"));
+    let fsync = std::env::var("KGDB_FSYNC").unwrap_or_default() == "1";
+    if fsync { tracing::info!("fsync: enabled (durability mode)"); }
+
+    let engine = Arc::new(Engine::new(&data_dir, fsync).expect("failed to initialise engine"));
     tracing::info!("KGDB starting  data={data_dir}  port={port}  bind={bind_addr}");
 
     // /health is intentionally unauthenticated for load-balancer probes
