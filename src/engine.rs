@@ -15,23 +15,25 @@ use dashmap::DashMap;
 use memchr::memchr_iter;
 use serde_json::Value;
 
-const WRITE_BUF: usize = 64  * 1024;   // 64 KB
-const READ_BUF:  usize = 128 * 1024;   // 128 KB
-const MAX_DOC:   usize = 16  * 1024 * 1024;
+const WRITE_BUF:  usize = 64  * 1024;        // 64 KB
+const READ_BUF:   usize = 128 * 1024;        // 128 KB
+const MAX_DOC:    usize = 16  * 1024 * 1024; // 16 MB per document
+const MAX_BATCH:  usize = 128 * 1024 * 1024; // 128 MB aggregate batch
+const MAX_OFFSET: usize = 10_000_000;
 
 // ── ID generation ─────────────────────────────────────────────────────────────
-// Format: [8B timestamp_ns hex][2B atomic counter hex][2B random hex] = 24 chars
+// Format: [16 hex timestamp_ns][4 hex counter][16 hex random] = 36 chars
 
 static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn new_id() -> String {
-    let ts = SystemTime::now()
+    let ts  = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos() as u64;
     let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) & 0xFFFF;
-    let rnd: [u8; 2] = rand::random();
-    format!("{ts:016x}{seq:04x}{:02x}{:02x}", rnd[0], rnd[1])
+    let rnd: [u8; 8] = rand::random();
+    format!("{ts:016x}{seq:04x}{:016x}", u64::from_be_bytes(rnd))
 }
 
 // ── errors ────────────────────────────────────────────────────────────────────
@@ -42,6 +44,10 @@ pub enum EngineError {
     InvalidName(String),
     #[error("document exceeds 16 MB limit")]
     TooLarge,
+    #[error("batch exceeds 128 MB aggregate size limit")]
+    BatchTooLarge,
+    #[error("offset exceeds maximum of {MAX_OFFSET}")]
+    OffsetTooLarge,
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
     #[error("JSON error: {0}")]
@@ -76,14 +82,17 @@ impl Engine {
 
     fn get_handle(&self, db: &str, coll: &str) -> Result<Handle, EngineError> {
         let key = (db.to_owned(), coll.to_owned());
+        // Hot path: read lock only
         if let Some(h) = self.handles.get(&key) {
             return Ok(Arc::clone(&*h));
         }
+        // Cold path: entry holds the shard write lock across check + insert, preventing TOCTOU
         let path = self.coll_path(db, coll)?;
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
-        let handle = Arc::new(Mutex::new(BufWriter::with_capacity(WRITE_BUF, file)));
-        self.handles.insert(key, Arc::clone(&handle));
-        Ok(handle)
+        let entry = self.handles.entry(key).or_try_insert_with(|| {
+            let file = OpenOptions::new().create(true).append(true).open(&path)?;
+            Ok::<Handle, EngineError>(Arc::new(Mutex::new(BufWriter::with_capacity(WRITE_BUF, file))))
+        })?;
+        Ok(Arc::clone(&*entry))
     }
 
     // ── writes ────────────────────────────────────────────────────────────────
@@ -91,7 +100,7 @@ impl Engine {
     pub fn insert(&self, db: &str, coll: &str, doc: Value) -> Result<String, EngineError> {
         let (id, line) = annotate(doc)?;
         let handle = self.get_handle(db, coll)?;
-        let mut w = handle.lock().unwrap();
+        let mut w = handle.lock().unwrap_or_else(|e| e.into_inner());
         w.write_all(line.as_bytes())?;
         w.flush()?;
         Ok(id)
@@ -107,11 +116,14 @@ impl Engine {
         for doc in docs {
             let (id, line) = annotate(doc)?;
             blob.extend_from_slice(line.as_bytes());
+            if blob.len() > MAX_BATCH {
+                return Err(EngineError::BatchTooLarge);
+            }
             ids.push(id);
         }
 
         let handle = self.get_handle(db, coll)?;
-        let mut w = handle.lock().unwrap();
+        let mut w = handle.lock().unwrap_or_else(|e| e.into_inner());
         w.write_all(&blob)?;
         w.flush()?;
         Ok(ids)
@@ -120,14 +132,15 @@ impl Engine {
     // ── reads ─────────────────────────────────────────────────────────────────
 
     pub fn find(&self, db: &str, coll: &str, n: usize, offset: usize) -> Result<Vec<Value>, EngineError> {
+        if offset > MAX_OFFSET {
+            return Err(EngineError::OffsetTooLarge);
+        }
         let path = self.coll_path(db, coll)?;
-        if !path.exists() { return Ok(vec![]); }
         scan(&path, Some(n), offset)
     }
 
     pub fn tail(&self, db: &str, coll: &str, n: usize) -> Result<Vec<Value>, EngineError> {
         let path = self.coll_path(db, coll)?;
-        if !path.exists() { return Ok(vec![]); }
         let total  = count_lines(&path)?;
         let offset = total.saturating_sub(n);
         scan(&path, Some(n), offset)
@@ -135,17 +148,17 @@ impl Engine {
 
     pub fn stats(&self, db: &str, coll: &str) -> Result<CollStats, EngineError> {
         let path = self.coll_path(db, coll)?;
-        if !path.exists() {
-            return Ok(CollStats { path: path.to_string_lossy().into_owned(), ..Default::default() });
-        }
-        let meta  = fs::metadata(&path)?;
+        let meta = match fs::metadata(&path) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(CollStats::default()),
+            Err(e) => return Err(e.into()),
+            Ok(m)  => m,
+        };
         let count = count_lines(&path)?;
         Ok(CollStats {
             exists:     true,
             count,
             size_bytes: meta.len(),
             size_mb:    (meta.len() as f64) / 1_048_576.0,
-            path:       path.to_string_lossy().into_owned(),
         })
     }
 
@@ -163,11 +176,16 @@ impl Engine {
         Ok(out)
     }
 
-    pub fn list_collections(&self, db: &str) -> io::Result<Vec<String>> {
+    pub fn list_collections(&self, db: &str) -> Result<Vec<String>, EngineError> {
+        validate_name(db)?;
         let dir = self.root.join(db);
-        if !dir.exists() { return Ok(vec![]); }
+        let rd = match fs::read_dir(&dir) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(vec![]),
+            Err(e) => return Err(e.into()),
+            Ok(rd) => rd,
+        };
         let mut out = vec![];
-        for e in fs::read_dir(dir)? {
+        for e in rd {
             let e    = e?;
             let name = e.file_name().to_string_lossy().into_owned();
             if let Some(stem) = name.strip_suffix(".ndjson") {
@@ -181,21 +199,34 @@ impl Engine {
     pub fn drop_collection(&self, db: &str, coll: &str) -> Result<bool, EngineError> {
         let key = (db.to_owned(), coll.to_owned());
         if let Some((_, h)) = self.handles.remove(&key) {
-            let _ = h.lock().unwrap().flush();
+            let _ = h.lock().unwrap_or_else(|e| e.into_inner()).flush();
         }
         let path = self.coll_path(db, coll)?;
-        if path.exists() { fs::remove_file(&path)?; return Ok(true); }
-        Ok(false)
+        match fs::remove_file(&path) {
+            Ok(())                                         => Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e)                                         => Err(e.into()),
+        }
     }
 
-    pub fn drop_database(&self, db: &str) -> io::Result<usize> {
+    pub fn drop_database(&self, db: &str) -> Result<usize, EngineError> {
+        validate_name(db)?;
         let dir = self.root.join(db);
-        if !dir.exists() { return Ok(0); }
+        let rd = match fs::read_dir(&dir) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e.into()),
+            Ok(rd) => rd,
+        };
         self.handles.retain(|(d, _), h| {
-            if d == db { let _ = h.lock().unwrap().flush(); false } else { true }
+            if d == db {
+                let _ = h.lock().unwrap_or_else(|e| e.into_inner()).flush();
+                false
+            } else {
+                true
+            }
         });
         let mut count = 0;
-        for e in fs::read_dir(&dir)? {
+        for e in rd {
             let e = e?;
             if e.file_name().to_string_lossy().ends_with(".ndjson") {
                 fs::remove_file(e.path())?;
@@ -215,7 +246,6 @@ pub struct CollStats {
     pub count:      usize,
     pub size_bytes: u64,
     pub size_mb:    f64,
-    pub path:       String,
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -232,13 +262,15 @@ fn validate_name(name: &str) -> Result<(), EngineError> {
 
 fn annotate(mut doc: Value) -> Result<(String, String), EngineError> {
     let id = new_id();
+    // _ts stored as string to preserve nanosecond precision past JSON's 2^53 safe integer limit
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_nanos() as u64;
+        .as_nanos()
+        .to_string();
     if let Value::Object(ref mut m) = doc {
         m.insert("_id".into(), Value::String(id.clone()));
-        m.insert("_ts".into(), Value::Number(ts.into()));
+        m.insert("_ts".into(), Value::String(ts));
     }
     let mut s = serde_json::to_string(&doc)?;
     if s.len() > MAX_DOC { return Err(EngineError::TooLarge); }
@@ -247,7 +279,11 @@ fn annotate(mut doc: Value) -> Result<(String, String), EngineError> {
 }
 
 fn scan(path: &Path, n: Option<usize>, offset: usize) -> Result<Vec<Value>, EngineError> {
-    let file   = File::open(path)?;
+    let file = match File::open(path) {
+        Ok(f)  => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(e) => return Err(e.into()),
+    };
     let reader = BufReader::with_capacity(READ_BUF, file);
     let mut docs    = Vec::new();
     let mut skipped = 0usize;
@@ -265,9 +301,12 @@ fn scan(path: &Path, n: Option<usize>, offset: usize) -> Result<Vec<Value>, Engi
     Ok(docs)
 }
 
-/// Fast newline count using SIMD-accelerated memchr.
 fn count_lines(path: &Path) -> io::Result<usize> {
-    let mut file  = File::open(path)?;
+    let mut file = match File::open(path) {
+        Ok(f)  => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
     let mut buf   = vec![0u8; READ_BUF];
     let mut count = 0usize;
     loop {

@@ -1,18 +1,21 @@
 //! KGDB — append-only JSON log database (Rust edition)
 //!
 //! Env vars:
-//!   KGDB_DATA    data directory (default: ./data)
-//!   KGDB_PORT    listen port    (default: 8000)
-//!   KGDB_FSYNC   set to "1" to fsync on every write (default: off)
-//!   RUST_LOG     tracing filter (default: info)
+//!   KGDB_DATA        data directory  (default: ./data)
+//!   KGDB_PORT        listen port     (default: 8000)
+//!   KGDB_BIND        bind address    (default: 127.0.0.1)
+//!   KGDB_AUTH_TOKEN  bearer token    (default: disabled)
+//!   KGDB_FSYNC       fsync on write  (default: off)
+//!   RUST_LOG         tracing filter  (default: info)
 
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, Query, Request, State},
     http::StatusCode,
-    response::{IntoResponse, Json},
-    routing::{delete, get, post},
+    middleware::Next,
+    response::{IntoResponse, Json, Response},
+    routing::{get, post},
     Router,
 };
 use serde::Deserialize;
@@ -33,14 +36,50 @@ impl From<EngineError> for AppError {
 }
 
 impl IntoResponse for AppError {
-    fn into_response(self) -> axum::response::Response {
-        let status = match &self.0 {
-            EngineError::InvalidName(_) => StatusCode::BAD_REQUEST,
-            EngineError::TooLarge       => StatusCode::PAYLOAD_TOO_LARGE,
-            _                           => StatusCode::INTERNAL_SERVER_ERROR,
+    fn into_response(self) -> Response {
+        let (status, msg) = match &self.0 {
+            EngineError::InvalidName(_) => (StatusCode::BAD_REQUEST,       self.0.to_string()),
+            EngineError::TooLarge       => (StatusCode::PAYLOAD_TOO_LARGE, self.0.to_string()),
+            EngineError::BatchTooLarge  => (StatusCode::PAYLOAD_TOO_LARGE, self.0.to_string()),
+            EngineError::OffsetTooLarge => (StatusCode::BAD_REQUEST,       self.0.to_string()),
+            // Don't leak filesystem paths or internal details to callers
+            EngineError::Io(_)
+            | EngineError::Json(_) => {
+                tracing::error!(err = %self.0, "internal engine error");
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal server error".to_string())
+            }
         };
-        (status, Json(json!({ "error": self.0.to_string() }))).into_response()
+        (status, Json(json!({ "error": msg }))).into_response()
     }
+}
+
+// ── auth ──────────────────────────────────────────────────────────────────────
+
+/// Constant-time comparison to prevent token oracle timing attacks.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() { return false; }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+async fn check_auth(token: Arc<Option<String>>, req: Request, next: Next) -> Response {
+    if let Some(expected) = token.as_ref() {
+        let ok = req
+            .headers()
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .map(|provided| ct_eq(provided.as_bytes(), expected.as_bytes()))
+            .unwrap_or(false);
+
+        if !ok {
+            return (StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))).into_response();
+        }
+    }
+    next.run(req).await
 }
 
 // ── query params ──────────────────────────────────────────────────────────────
@@ -83,17 +122,17 @@ async fn health() -> impl IntoResponse {
 async fn list_collections(
     State(eng): State<AppState>,
     Path(db): Path<String>,
-) -> impl IntoResponse {
-    let colls = eng.list_collections(&db).unwrap_or_default();
-    Json(json!({ "db": db, "collections": colls }))
+) -> Result<Json<Value>, AppError> {
+    let colls = eng.list_collections(&db)?;
+    Ok(Json(json!({ "db": db, "collections": colls })))
 }
 
 async fn drop_database(
     State(eng): State<AppState>,
     Path(db): Path<String>,
-) -> impl IntoResponse {
-    let n = eng.drop_database(&db).unwrap_or(0);
-    Json(json!({ "db": db, "dropped": true, "collections_removed": n }))
+) -> Result<Json<Value>, AppError> {
+    let n = eng.drop_database(&db)?;
+    Ok(Json(json!({ "db": db, "dropped": true, "collections_removed": n })))
 }
 
 // ── collection ────────────────────────────────────────────────────────────────
@@ -198,29 +237,47 @@ async fn main() {
         )
         .init();
 
-    let data_dir = std::env::var("KGDB_DATA").unwrap_or_else(|_| "./data".into());
+    let data_dir  = std::env::var("KGDB_DATA").unwrap_or_else(|_| "./data".into());
     let port: u16 = std::env::var("KGDB_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(8000);
+    let bind_addr  = std::env::var("KGDB_BIND").unwrap_or_else(|_| "127.0.0.1".into());
+    let auth_token = Arc::new(std::env::var("KGDB_AUTH_TOKEN").ok());
+
+    if auth_token.is_some() {
+        tracing::info!("auth: bearer token enabled");
+    } else {
+        tracing::warn!("auth: disabled — set KGDB_AUTH_TOKEN to require authentication");
+    }
 
     let engine = Arc::new(Engine::new(&data_dir).expect("failed to initialise engine"));
-    tracing::info!("KGDB starting  data={data_dir}  port={port}");
+    tracing::info!("KGDB starting  data={data_dir}  port={port}  bind={bind_addr}");
+
+    // /health is intentionally unauthenticated for load-balancer probes
+    let protected = {
+        let token = Arc::clone(&auth_token);
+        Router::new()
+            .route("/",                      get(root))
+            .route("/v1/:db",                get(list_collections).delete(drop_database))
+            .route("/v1/:db/:coll",          post(insert_one).delete(drop_collection))
+            .route("/v1/:db/:coll/batch",    post(insert_many))
+            .route("/v1/:db/:coll/find",     get(find))
+            .route("/v1/:db/:coll/tail",     get(tail))
+            .route("/v1/:db/:coll/stats",    get(stats))
+            .route_layer(axum::middleware::from_fn(move |req, next| {
+                check_auth(Arc::clone(&token), req, next)
+            }))
+    };
 
     let app = Router::new()
-        .route("/",                      get(root))
-        .route("/health",                get(health))
-        .route("/v1/:db",                get(list_collections).delete(drop_database))
-        .route("/v1/:db/:coll",          post(insert_one).delete(drop_collection))
-        .route("/v1/:db/:coll/batch",    post(insert_many))
-        .route("/v1/:db/:coll/find",     get(find))
-        .route("/v1/:db/:coll/tail",     get(tail))
-        .route("/v1/:db/:coll/stats",    get(stats))
+        .route("/health", get(health))
+        .merge(protected)
+        .layer(axum::extract::DefaultBodyLimit::max(16 * 1024 * 1024))
         .with_state(engine);
 
-    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
-        .await
-        .unwrap();
-    tracing::info!("listening on http://0.0.0.0:{port}");
+    let bind = format!("{bind_addr}:{port}");
+    let listener = tokio::net::TcpListener::bind(&bind).await.unwrap();
+    tracing::info!("listening on http://{bind}");
     axum::serve(listener, app).await.unwrap();
 }
