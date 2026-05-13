@@ -4,9 +4,9 @@
 //! File handles kept warm in a DashMap; writes are a single write_all() per batch.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::{self, File, OpenOptions},
-    io::{self, BufRead, BufReader, BufWriter, Read, Write},
+    io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
@@ -59,16 +59,24 @@ pub enum EngineError {
 
 type Handle = Arc<Mutex<BufWriter<File>>>;
 
+/// field_name -> value_as_json_string -> sorted Vec<byte_offset>
+type FieldIndex = DashMap<String, Vec<u64>>;
+/// field_name -> FieldIndex
+type CollIndexes = DashMap<String, FieldIndex>;
+
 pub struct Engine {
     root:    PathBuf,
     handles: DashMap<(String, String), Handle>,
+    indexes: DashMap<(String, String), CollIndexes>,
 }
 
 impl Engine {
     pub fn new(root: impl Into<PathBuf>) -> io::Result<Self> {
         let root = root.into();
         fs::create_dir_all(&root)?;
-        Ok(Self { root, handles: DashMap::new() })
+        let eng = Self { root, handles: DashMap::new(), indexes: DashMap::new() };
+        eng.rebuild_indexes()?;
+        Ok(eng)
     }
 
     // ── internals ─────────────────────────────────────────────────────────────
@@ -79,6 +87,94 @@ impl Engine {
         let dir = self.root.join(db);
         fs::create_dir_all(&dir)?;
         Ok(dir.join(format!("{coll}.ndjson")))
+    }
+
+    fn sidecar_path(&self, db: &str, coll: &str) -> PathBuf {
+        self.root.join(db).join(format!("{coll}.index.json"))
+    }
+
+    fn save_sidecar(&self, db: &str, coll: &str) -> io::Result<()> {
+        let key = (db.to_owned(), coll.to_owned());
+        let mut fields: Vec<String> = if let Some(coll_indexes) = self.indexes.get(&key) {
+            coll_indexes.iter().map(|e| e.key().clone()).collect()
+        } else {
+            vec![]
+        };
+        fields.sort();
+        let path = self.sidecar_path(db, coll);
+        let json = serde_json::json!({ "fields": fields });
+        let s = serde_json::to_string(&json)?;
+        // Create parent dir if needed
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        if fields.is_empty() {
+            // Remove sidecar if no indexes remain
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        } else {
+            fs::write(&path, s)?;
+        }
+        Ok(())
+    }
+
+    fn rebuild_indexes(&self) -> io::Result<()> {
+        // Walk data dir looking for *.index.json files
+        let rd = match fs::read_dir(&self.root) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+            Ok(rd) => rd,
+        };
+        for db_entry in rd {
+            let db_entry = db_entry?;
+            if !db_entry.file_type()?.is_dir() {
+                continue;
+            }
+            let db_name = db_entry.file_name().to_string_lossy().into_owned();
+            let db_rd = match fs::read_dir(db_entry.path()) {
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+                Ok(rd) => rd,
+            };
+            for coll_entry in db_rd {
+                let coll_entry = coll_entry?;
+                let fname = coll_entry.file_name().to_string_lossy().into_owned();
+                let coll_name = match fname.strip_suffix(".index.json") {
+                    Some(n) => n.to_owned(),
+                    None => continue,
+                };
+                // Read the sidecar
+                let sidecar_path = coll_entry.path();
+                let content = match fs::read_to_string(&sidecar_path) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let sidecar: serde_json::Value = match serde_json::from_str(&content) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let fields = match sidecar.get("fields").and_then(|v| v.as_array()) {
+                    Some(f) => f.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_owned()))
+                        .collect::<Vec<_>>(),
+                    None => continue,
+                };
+                let data_path = self.root.join(&db_name).join(format!("{coll_name}.ndjson"));
+                let key = (db_name.clone(), coll_name.clone());
+                let coll_indexes: CollIndexes = DashMap::new();
+                for field in &fields {
+                    match build_field_index(&data_path, field) {
+                        Ok(fi) => { coll_indexes.insert(field.clone(), fi); }
+                        Err(_) => continue,
+                    }
+                }
+                self.indexes.insert(key, coll_indexes);
+            }
+        }
+        Ok(())
     }
 
     fn get_handle(&self, db: &str, coll: &str) -> Result<Handle, EngineError> {
@@ -96,14 +192,34 @@ impl Engine {
         Ok(Arc::clone(&*entry))
     }
 
+    fn update_indexes_for_doc(&self, db: &str, coll: &str, doc: &Value, offset: u64) {
+        let key = (db.to_owned(), coll.to_owned());
+        if let Some(coll_indexes) = self.indexes.get(&key) {
+            for field_entry in coll_indexes.iter() {
+                let field = field_entry.key();
+                let field_index = field_entry.value();
+                if let Some(val) = doc.get(field) {
+                    let val_str = serde_json::to_string(val).unwrap_or_default();
+                    field_index.entry(val_str).or_default().push(offset);
+                }
+            }
+        }
+    }
+
     // ── writes ────────────────────────────────────────────────────────────────
 
     pub fn insert(&self, db: &str, coll: &str, doc: Value) -> Result<String, EngineError> {
         let (id, line) = annotate(doc)?;
         let handle = self.get_handle(db, coll)?;
         let mut w = handle.lock().unwrap_or_else(|e| e.into_inner());
+        w.flush()?;
+        let offset = w.get_ref().metadata()?.len();
         w.write_all(line.as_bytes())?;
         w.flush()?;
+        // Re-parse the annotated line for index updating
+        let annotated_doc: Value = serde_json::from_str(line.trim_end_matches('\n'))?;
+        drop(w);
+        self.update_indexes_for_doc(db, coll, &annotated_doc, offset);
         Ok(id)
     }
 
@@ -113,20 +229,33 @@ impl Engine {
         }
         let mut ids  = Vec::with_capacity(docs.len());
         let mut blob = Vec::new();
+        // Track (annotated_doc, relative_offset_in_blob)
+        let mut doc_offsets: Vec<(Value, u64)> = Vec::with_capacity(docs.len());
 
         for doc in docs {
+            let rel_offset = blob.len() as u64;
             let (id, line) = annotate(doc)?;
+            let annotated_doc: Value = serde_json::from_str(line.trim_end_matches('\n'))?;
             blob.extend_from_slice(line.as_bytes());
             if blob.len() > MAX_BATCH {
                 return Err(EngineError::BatchTooLarge);
             }
             ids.push(id);
+            doc_offsets.push((annotated_doc, rel_offset));
         }
 
         let handle = self.get_handle(db, coll)?;
         let mut w = handle.lock().unwrap_or_else(|e| e.into_inner());
+        w.flush()?;
+        let base = w.get_ref().metadata()?.len();
         w.write_all(&blob)?;
         w.flush()?;
+        drop(w);
+
+        for (doc, rel_offset) in doc_offsets {
+            self.update_indexes_for_doc(db, coll, &doc, base + rel_offset);
+        }
+
         Ok(ids)
     }
 
@@ -144,6 +273,56 @@ impl Engine {
             return Err(EngineError::OffsetTooLarge);
         }
         let path = self.coll_path(db, coll)?;
+
+        // Try index-accelerated path
+        if let Some(f) = filter {
+            if !f.is_empty() {
+                let key = (db.to_owned(), coll.to_owned());
+                if let Some(coll_indexes) = self.indexes.get(&key) {
+                    // Check if ALL filter fields are indexed
+                    let all_indexed = f.keys().all(|k| coll_indexes.contains_key(k));
+                    if all_indexed {
+                        // For each filter field, collect matching offsets
+                        let mut offset_sets: Vec<HashSet<u64>> = Vec::new();
+                        for (field, val) in f {
+                            let val_str = serde_json::to_string(val)?;
+                            let offsets_for_field: HashSet<u64> =
+                                if let Some(field_index) = coll_indexes.get(field) {
+                                    if let Some(offsets) = field_index.get(&val_str) {
+                                        offsets.iter().copied().collect()
+                                    } else {
+                                        HashSet::new()
+                                    }
+                                } else {
+                                    HashSet::new()
+                                };
+                            offset_sets.push(offsets_for_field);
+                        }
+                        // Intersect all offset sets
+                        let mut intersected: HashSet<u64> = if offset_sets.is_empty() {
+                            HashSet::new()
+                        } else {
+                            offset_sets[0].clone()
+                        };
+                        for s in &offset_sets[1..] {
+                            intersected = intersected.intersection(s).copied().collect();
+                        }
+                        // Sort offsets
+                        let mut sorted_offsets: Vec<u64> = intersected.into_iter().collect();
+                        sorted_offsets.sort_unstable();
+                        // Apply pagination (offset/n over matching docs)
+                        let paginated: Vec<u64> = sorted_offsets
+                            .into_iter()
+                            .skip(offset)
+                            .take(n)
+                            .collect();
+                        return read_at_offsets(&path, &paginated);
+                    }
+                }
+            }
+        }
+
+        // Fall back to full scan
         scan(&path, Some(n), offset, filter)
     }
 
@@ -182,6 +361,56 @@ impl Engine {
             size_bytes: meta.len(),
             size_mb:    (meta.len() as f64) / 1_048_576.0,
         })
+    }
+
+    // ── index management ──────────────────────────────────────────────────────
+
+    pub fn create_index(&self, db: &str, coll: &str, field: &str) -> Result<(), EngineError> {
+        validate_name(db)?;
+        validate_name(coll)?;
+        validate_name(field)?;
+        let key = (db.to_owned(), coll.to_owned());
+        // Check if already indexed
+        if let Some(coll_indexes) = self.indexes.get(&key) {
+            if coll_indexes.contains_key(field) {
+                return Ok(());
+            }
+        }
+        let data_path = self.root.join(db).join(format!("{coll}.ndjson"));
+        let fi = build_field_index(&data_path, field)?;
+        self.indexes
+            .entry(key)
+            .or_insert_with(DashMap::new)
+            .insert(field.to_owned(), fi);
+        self.save_sidecar(db, coll)?;
+        Ok(())
+    }
+
+    pub fn list_indexes(&self, db: &str, coll: &str) -> Result<Vec<String>, EngineError> {
+        validate_name(db)?;
+        validate_name(coll)?;
+        let key = (db.to_owned(), coll.to_owned());
+        let mut fields: Vec<String> = if let Some(coll_indexes) = self.indexes.get(&key) {
+            coll_indexes.iter().map(|e| e.key().clone()).collect()
+        } else {
+            vec![]
+        };
+        fields.sort();
+        Ok(fields)
+    }
+
+    pub fn drop_index(&self, db: &str, coll: &str, field: &str) -> Result<bool, EngineError> {
+        validate_name(db)?;
+        validate_name(coll)?;
+        validate_name(field)?;
+        let key = (db.to_owned(), coll.to_owned());
+        let existed = if let Some(coll_indexes) = self.indexes.get(&key) {
+            coll_indexes.remove(field).is_some()
+        } else {
+            false
+        };
+        self.save_sidecar(db, coll)?;
+        Ok(existed)
     }
 
     // ── DDL ───────────────────────────────────────────────────────────────────
@@ -223,6 +452,13 @@ impl Engine {
         if let Some((_, h)) = self.handles.remove(&key) {
             let _ = h.lock().unwrap_or_else(|e| e.into_inner()).flush();
         }
+        self.indexes.remove(&key);
+        let sidecar = self.sidecar_path(db, coll);
+        match fs::remove_file(&sidecar) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
         let path = self.coll_path(db, coll)?;
         match fs::remove_file(&path) {
             Ok(())                                         => Ok(true),
@@ -247,12 +483,16 @@ impl Engine {
                 true
             }
         });
+        self.indexes.retain(|(d, _), _| d != db);
         let mut count = 0;
         for e in rd {
             let e = e?;
-            if e.file_name().to_string_lossy().ends_with(".ndjson") {
+            let fname = e.file_name().to_string_lossy().into_owned();
+            if fname.ends_with(".ndjson") {
                 fs::remove_file(e.path())?;
                 count += 1;
+            } else if fname.ends_with(".index.json") {
+                let _ = fs::remove_file(e.path());
             }
         }
         let _ = fs::remove_dir(&dir);
@@ -298,6 +538,63 @@ fn annotate(mut doc: Value) -> Result<(String, String), EngineError> {
     if s.len() > MAX_DOC { return Err(EngineError::TooLarge); }
     s.push('\n');
     Ok((id, s))
+}
+
+/// Build a FieldIndex for the given field by scanning the NDJSON file line by line,
+/// tracking byte offset of each line.
+fn build_field_index(path: &Path, field: &str) -> io::Result<FieldIndex> {
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(DashMap::new()),
+        Err(e) => return Err(e),
+    };
+    let mut reader = BufReader::with_capacity(READ_BUF, file);
+    let index: FieldIndex = DashMap::new();
+    let mut offset: u64 = 0;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let n = reader.read_line(&mut line)?;
+        if n == 0 { break; }
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            if let Ok(doc) = serde_json::from_str::<Value>(trimmed) {
+                if let Some(val) = doc.get(field) {
+                    let val_str = serde_json::to_string(val)
+                        .unwrap_or_default();
+                    index.entry(val_str).or_default().push(offset);
+                }
+            }
+        }
+        offset += n as u64;
+    }
+    Ok(index)
+}
+
+/// Seek to each offset in the file, read one line, and deserialize it.
+fn read_at_offsets(path: &Path, offsets: &[u64]) -> Result<Vec<Value>, EngineError> {
+    if offsets.is_empty() {
+        return Ok(vec![]);
+    }
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(e) => return Err(e.into()),
+    };
+    let mut reader = BufReader::with_capacity(READ_BUF, file);
+    let mut docs = Vec::with_capacity(offsets.len());
+    let mut line = String::new();
+    for &off in offsets {
+        reader.seek(SeekFrom::Start(off))?;
+        line.clear();
+        let n = reader.read_line(&mut line)?;
+        if n == 0 { continue; }
+        let trimmed = line.trim();
+        if trimmed.is_empty() { continue; }
+        let doc: Value = serde_json::from_str(trimmed)?;
+        docs.push(doc);
+    }
+    Ok(docs)
 }
 
 /// Full scan with optional field-equality filter (AND semantics).

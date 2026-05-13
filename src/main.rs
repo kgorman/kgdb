@@ -15,7 +15,7 @@ use axum::{
     http::StatusCode,
     middleware::Next,
     response::{IntoResponse, Json, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
     Router,
 };
 use serde::Deserialize;
@@ -23,7 +23,7 @@ use serde_json::{json, Value};
 use tokio::task;
 
 mod engine;
-use engine::{Engine, EngineError};
+use engine::{validate_name, Engine, EngineError};
 
 type AppState = Arc<Engine>;
 
@@ -256,6 +256,50 @@ async fn drop_collection(
     Ok(Json(json!({ "db": db, "collection": coll, "dropped": dropped })))
 }
 
+// ── index management ──────────────────────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+struct CreateIndexBody {
+    field: String,
+}
+
+async fn create_index(
+    State(eng): State<AppState>,
+    Path((db, coll)): Path<(String, String)>,
+    Json(body): Json<CreateIndexBody>,
+) -> Result<(StatusCode, Json<Value>), AppError> {
+    validate_name(&body.field).map_err(AppError::from)?;
+    let field = body.field;
+    let (db2, coll2, field2) = (db.clone(), coll.clone(), field.clone());
+    task::spawn_blocking(move || eng.create_index(&db2, &coll2, &field2))
+        .await
+        .unwrap()?;
+    Ok((StatusCode::CREATED, Json(json!({ "db": db, "collection": coll, "field": field, "created": true }))))
+}
+
+async fn list_indexes(
+    State(eng): State<AppState>,
+    Path((db, coll)): Path<(String, String)>,
+) -> Result<Json<Value>, AppError> {
+    let (db2, coll2) = (db.clone(), coll.clone());
+    let fields = task::spawn_blocking(move || eng.list_indexes(&db2, &coll2))
+        .await
+        .unwrap()?;
+    Ok(Json(json!({ "db": db, "collection": coll, "indexes": fields })))
+}
+
+async fn drop_index(
+    State(eng): State<AppState>,
+    Path((db, coll, field)): Path<(String, String, String)>,
+) -> Result<Json<Value>, AppError> {
+    validate_name(&field).map_err(AppError::from)?;
+    let field2 = field.clone();
+    let existed = task::spawn_blocking(move || eng.drop_index(&db, &coll, &field2))
+        .await
+        .unwrap()?;
+    Ok(Json(json!({ "field": field, "dropped": existed })))
+}
+
 // ── main ──────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -294,6 +338,9 @@ async fn main() {
             .route("/v1/:db/:coll/find",     get(find))
             .route("/v1/:db/:coll/tail",     get(tail))
             .route("/v1/:db/:coll/stats",    get(stats))
+            .route("/v1/:db/:coll/index",        post(create_index))
+            .route("/v1/:db/:coll/indexes",      get(list_indexes))
+            .route("/v1/:db/:coll/index/:field", delete(drop_index))
             .route_layer(axum::middleware::from_fn(move |req, next| {
                 check_auth(Arc::clone(&token), req, next)
             }))
