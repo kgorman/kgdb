@@ -8,7 +8,7 @@
 //!   KGDB_FSYNC       fsync on write  (default: off)
 //!   RUST_LOG         tracing filter  (default: info)
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use axum::{
     extract::{Path, Query, Request, State},
@@ -90,15 +90,38 @@ struct FindParams {
     n: usize,
     #[serde(default)]
     offset: usize,
+    /// Field equality filter as a JSON object: {"field":"value",...}
+    #[serde(rename = "where")]
+    filter: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct TailParams {
     #[serde(default = "default_n")]
     n: usize,
+    /// Field equality filter as a JSON object: {"field":"value",...}
+    #[serde(rename = "where")]
+    filter: Option<String>,
 }
 
 fn default_n() -> usize { 20 }
+
+/// Parse the raw `where` query string into a HashMap. Returns 400 on bad input.
+fn parse_filter(raw: Option<String>) -> Result<Option<HashMap<String, Value>>, (StatusCode, Json<Value>)> {
+    let Some(s) = raw else { return Ok(None) };
+    let v: Value = serde_json::from_str(&s).map_err(|_| (
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "error": "invalid JSON in 'where' parameter" })),
+    ))?;
+    match v {
+        Value::Object(m) if m.is_empty() => Ok(None),
+        Value::Object(m) => Ok(Some(m.into_iter().collect())),
+        _ => Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "'where' must be a JSON object" })),
+        )),
+    }
+}
 
 // ── handlers ──────────────────────────────────────────────────────────────────
 
@@ -174,30 +197,36 @@ async fn find(
     State(eng): State<AppState>,
     Path((db, coll)): Path<(String, String)>,
     Query(p): Query<FindParams>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<Value>, Response> {
     if p.n == 0 || p.n > 100_000 {
         return Ok(Json(json!({ "error": "n must be 1–100000" })));
     }
+    let filter = parse_filter(p.filter).map_err(IntoResponse::into_response)?;
     let (db2, coll2) = (db.clone(), coll.clone());
-    let docs = task::spawn_blocking(move || eng.find(&db2, &coll2, p.n, p.offset))
+    let (n, offset)  = (p.n, p.offset);
+    let docs = task::spawn_blocking(move || eng.find(&db2, &coll2, n, offset, filter.as_ref()))
         .await
-        .unwrap()?;
+        .unwrap()
+        .map_err(|e| AppError(e).into_response())?;
     let count = docs.len();
-    Ok(Json(json!({ "db": db, "collection": coll, "offset": p.offset, "count": count, "documents": docs })))
+    Ok(Json(json!({ "db": db, "collection": coll, "offset": offset, "count": count, "documents": docs })))
 }
 
 async fn tail(
     State(eng): State<AppState>,
     Path((db, coll)): Path<(String, String)>,
     Query(p): Query<TailParams>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<Value>, Response> {
     if p.n == 0 || p.n > 100_000 {
         return Ok(Json(json!({ "error": "n must be 1–100000" })));
     }
+    let filter = parse_filter(p.filter).map_err(IntoResponse::into_response)?;
     let (db2, coll2) = (db.clone(), coll.clone());
-    let docs = task::spawn_blocking(move || eng.tail(&db2, &coll2, p.n))
+    let n = p.n;
+    let docs = task::spawn_blocking(move || eng.tail(&db2, &coll2, n, filter.as_ref()))
         .await
-        .unwrap()?;
+        .unwrap()
+        .map_err(|e| AppError(e).into_response())?;
     let count = docs.len();
     Ok(Json(json!({ "db": db, "collection": coll, "count": count, "documents": docs })))
 }

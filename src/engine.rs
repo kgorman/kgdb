@@ -4,6 +4,7 @@
 //! File handles kept warm in a DashMap; writes are a single write_all() per batch.
 
 use std::{
+    collections::HashMap,
     fs::{self, File, OpenOptions},
     io::{self, BufRead, BufReader, BufWriter, Read, Write},
     path::{Path, PathBuf},
@@ -131,19 +132,40 @@ impl Engine {
 
     // ── reads ─────────────────────────────────────────────────────────────────
 
-    pub fn find(&self, db: &str, coll: &str, n: usize, offset: usize) -> Result<Vec<Value>, EngineError> {
+    pub fn find(
+        &self,
+        db: &str,
+        coll: &str,
+        n: usize,
+        offset: usize,
+        filter: Option<&HashMap<String, Value>>,
+    ) -> Result<Vec<Value>, EngineError> {
         if offset > MAX_OFFSET {
             return Err(EngineError::OffsetTooLarge);
         }
         let path = self.coll_path(db, coll)?;
-        scan(&path, Some(n), offset)
+        scan(&path, Some(n), offset, filter)
     }
 
-    pub fn tail(&self, db: &str, coll: &str, n: usize) -> Result<Vec<Value>, EngineError> {
+    pub fn tail(
+        &self,
+        db: &str,
+        coll: &str,
+        n: usize,
+        filter: Option<&HashMap<String, Value>>,
+    ) -> Result<Vec<Value>, EngineError> {
         let path = self.coll_path(db, coll)?;
+        if let Some(f) = filter {
+            if !f.is_empty() {
+                // With a filter, collect all matching docs then return the last n
+                let all = scan(&path, None, 0, Some(f))?;
+                let start = all.len().saturating_sub(n);
+                return Ok(all.into_iter().skip(start).collect());
+            }
+        }
         let total  = count_lines(&path)?;
         let offset = total.saturating_sub(n);
-        scan(&path, Some(n), offset)
+        scan(&path, Some(n), offset, None)
     }
 
     pub fn stats(&self, db: &str, coll: &str) -> Result<CollStats, EngineError> {
@@ -250,7 +272,7 @@ pub struct CollStats {
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-fn validate_name(name: &str) -> Result<(), EngineError> {
+pub fn validate_name(name: &str) -> Result<(), EngineError> {
     if name.is_empty() || name.len() > 128 {
         return Err(EngineError::InvalidName(name.to_owned()));
     }
@@ -278,7 +300,14 @@ fn annotate(mut doc: Value) -> Result<(String, String), EngineError> {
     Ok((id, s))
 }
 
-fn scan(path: &Path, n: Option<usize>, offset: usize) -> Result<Vec<Value>, EngineError> {
+/// Full scan with optional field-equality filter (AND semantics).
+/// Offset counts only documents that pass the filter.
+fn scan(
+    path: &Path,
+    n: Option<usize>,
+    offset: usize,
+    filter: Option<&HashMap<String, Value>>,
+) -> Result<Vec<Value>, EngineError> {
     let file = match File::open(path) {
         Ok(f)  => f,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(vec![]),
@@ -292,13 +321,23 @@ fn scan(path: &Path, n: Option<usize>, offset: usize) -> Result<Vec<Value>, Engi
         let line = line?;
         let line = line.trim();
         if line.is_empty() { continue; }
+        let doc: Value = serde_json::from_str(line)?;
+        if let Some(f) = filter {
+            if !matches_filter(&doc, f) { continue; }
+        }
         if skipped < offset { skipped += 1; continue; }
-        docs.push(serde_json::from_str(line)?);
+        docs.push(doc);
         if let Some(limit) = n {
             if docs.len() >= limit { break; }
         }
     }
     Ok(docs)
+}
+
+/// Returns true if all filter key=value pairs match the document (AND semantics).
+fn matches_filter(doc: &Value, filter: &HashMap<String, Value>) -> bool {
+    let Value::Object(map) = doc else { return false };
+    filter.iter().all(|(k, v)| map.get(k) == Some(v))
 }
 
 fn count_lines(path: &Path) -> io::Result<usize> {
