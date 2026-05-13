@@ -4,7 +4,8 @@
 //!   KGDB_DATA        data directory  (default: ./data)
 //!   KGDB_PORT        listen port     (default: 8000)
 //!   KGDB_BIND        bind address    (default: 127.0.0.1)
-//!   KGDB_AUTH_TOKEN  bearer token    (default: disabled)
+//!   KGDB_AUTH_TOKEN           global bearer token    (default: disabled)
+//!   KGDB_AUTH_TOKEN_<dbname>  per-db bearer token    (default: disabled)
 //!   KGDB_FSYNC       fsync on write  (default: off)
 //!   RUST_LOG         tracing filter  (default: info)
 
@@ -65,19 +66,55 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-async fn check_auth(token: Arc<Option<String>>, req: Request, next: Next) -> Response {
-    if let Some(expected) = token.as_ref() {
-        let ok = req
-            .headers()
-            .get(axum::http::header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .map(|provided| ct_eq(provided.as_bytes(), expected.as_bytes()))
-            .unwrap_or(false);
+/// Token configuration: one optional global admin token + per-database tokens.
+///
+/// Global token:    KGDB_AUTH_TOKEN=<token>
+/// Per-db tokens:   KGDB_AUTH_TOKEN_<dbname>=<token>
+///
+/// For a request to /v1/{db}/..., either the global or the db-scoped token is accepted.
+/// For routes without a db segment (/), only the global token applies.
+/// If no token is configured for a route, access is open.
+struct AuthConfig {
+    global: Option<String>,
+    per_db: HashMap<String, String>,
+}
 
-        if !ok {
-            return (StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))).into_response();
+impl AuthConfig {
+    fn is_authorized(&self, provided: Option<&str>, db: Option<&str>) -> bool {
+        let global_required = self.global.is_some();
+        let db_required     = db.and_then(|d| self.per_db.get(d)).is_some();
+        if !global_required && !db_required {
+            return true; // no auth configured for this route
         }
+        let Some(tok) = provided else { return false };
+        if let Some(g) = &self.global {
+            if ct_eq(tok.as_bytes(), g.as_bytes()) { return true; }
+        }
+        if let Some(d) = db {
+            if let Some(t) = self.per_db.get(d) {
+                if ct_eq(tok.as_bytes(), t.as_bytes()) { return true; }
+            }
+        }
+        false
+    }
+}
+
+/// Extract the database name from a URI path of the form /v1/{db}/...
+fn extract_db(path: &str) -> Option<&str> {
+    let rest = path.strip_prefix("/v1/")?;
+    let db   = rest.split('/').next()?;
+    if db.is_empty() { None } else { Some(db) }
+}
+
+async fn check_auth(auth: Arc<AuthConfig>, req: Request, next: Next) -> Response {
+    let db       = extract_db(req.uri().path());
+    let provided = req.headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+
+    if !auth.is_authorized(provided, db) {
+        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))).into_response();
     }
     next.run(req).await
 }
@@ -386,12 +423,26 @@ async fn main() {
         .and_then(|p| p.parse().ok())
         .unwrap_or(8000);
     let bind_addr  = std::env::var("KGDB_BIND").unwrap_or_else(|_| "127.0.0.1".into());
-    let auth_token = Arc::new(std::env::var("KGDB_AUTH_TOKEN").ok());
+    let mut per_db: HashMap<String, String> = HashMap::new();
+    for (key, val) in std::env::vars() {
+        if let Some(db_name) = key.strip_prefix("KGDB_AUTH_TOKEN_") {
+            if !db_name.is_empty() {
+                per_db.insert(db_name.to_owned(), val);
+            }
+        }
+    }
+    let auth = Arc::new(AuthConfig {
+        global: std::env::var("KGDB_AUTH_TOKEN").ok(),
+        per_db,
+    });
 
-    if auth_token.is_some() {
-        tracing::info!("auth: bearer token enabled");
-    } else {
+    if auth.global.is_some() {
+        tracing::info!("auth: global bearer token enabled");
+    } else if auth.per_db.is_empty() {
         tracing::warn!("auth: disabled — set KGDB_AUTH_TOKEN to require authentication");
+    }
+    for db_name in auth.per_db.keys() {
+        tracing::info!("auth: per-db token enabled for database '{db_name}'");
     }
 
     let engine = Arc::new(Engine::new(&data_dir).expect("failed to initialise engine"));
@@ -399,7 +450,7 @@ async fn main() {
 
     // /health is intentionally unauthenticated for load-balancer probes
     let protected = {
-        let token = Arc::clone(&auth_token);
+        let auth2 = Arc::clone(&auth);
         Router::new()
             .route("/",                      get(root))
             .route("/v1/:db",                get(list_collections).delete(drop_database))
@@ -412,7 +463,7 @@ async fn main() {
             .route("/v1/:db/:coll/indexes",      get(list_indexes))
             .route("/v1/:db/:coll/index/:field", delete(drop_index))
             .route_layer(axum::middleware::from_fn(move |req, next| {
-                check_auth(Arc::clone(&token), req, next)
+                check_auth(Arc::clone(&auth2), req, next)
             }))
     };
 

@@ -74,14 +74,15 @@ cargo build --release
 
 All configuration via environment variables.
 
-| Variable          | Default     | Description |
-|-------------------|-------------|-------------|
-| `KGDB_DATA`       | `./data`    | Directory where database files are stored |
-| `KGDB_PORT`       | `8000`      | HTTP listen port |
-| `KGDB_BIND`       | `127.0.0.1` | Bind address (`0.0.0.0` to expose on all interfaces) |
-| `KGDB_AUTH_TOKEN` | _(unset)_   | Bearer token — required on all requests when set |
-| `KGDB_FSYNC`      | `0`         | Set to `1` to fsync on every write |
-| `RUST_LOG`        | `info`      | Log filter (e.g. `debug`, `kgdb=trace`) |
+| Variable                      | Default     | Description |
+|-------------------------------|-------------|-------------|
+| `KGDB_DATA`                   | `./data`    | Directory where database files are stored |
+| `KGDB_PORT`                   | `8000`      | HTTP listen port |
+| `KGDB_BIND`                   | `127.0.0.1` | Bind address (`0.0.0.0` to expose on all interfaces) |
+| `KGDB_AUTH_TOKEN`             | _(unset)_   | Global bearer token — required on all requests when set |
+| `KGDB_AUTH_TOKEN_<dbname>`    | _(unset)_   | Per-database bearer token — required only for that database |
+| `KGDB_FSYNC`                  | `0`         | Set to `1` to fsync on every write |
+| `RUST_LOG`                    | `info`      | Log filter (e.g. `debug`, `kgdb=trace`) |
 
 ```bash
 KGDB_DATA=/var/kgdb \
@@ -95,12 +96,33 @@ KGDB_DATA=/var/kgdb \
 
 ## Authentication
 
-Set `KGDB_AUTH_TOKEN` to require a bearer token on all requests (except `/health`):
+### Global token
+
+Set `KGDB_AUTH_TOKEN` to require a bearer token on all requests:
 
 ```bash
+KGDB_AUTH_TOKEN=$(openssl rand -hex 32) ./kgdb
+
 curl -H 'Authorization: Bearer <token>' \
   http://127.0.0.1:8000/v1/mydb/users/find
 ```
+
+### Per-database tokens
+
+Set `KGDB_AUTH_TOKEN_<dbname>` to require a token for a specific database only. Other databases remain open unless they have their own token or a global token is set.
+
+```bash
+# Only the "logs" database requires auth; everything else is open
+KGDB_AUTH_TOKEN_logs=$(openssl rand -hex 32) ./kgdb
+
+curl -H 'Authorization: Bearer <logs-token>' \
+  http://127.0.0.1:8000/v1/logs/events/find
+
+# Requests to /v1/metrics/... require no token
+curl http://127.0.0.1:8000/v1/metrics/cpu/find
+```
+
+Both global and per-db tokens are accepted for a database that has both configured.
 
 Wrong or missing token → `401 {"error":"unauthorized"}`.
 `/health` is always unauthenticated for load-balancer probes.
@@ -139,24 +161,44 @@ Database and collection names: alphanumeric, `_`, `-`, max 128 chars.
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/v1/:db/:coll/find` | Paginated scan with optional filter |
-| `GET` | `/v1/:db/:coll/tail` | Last N documents with optional filter |
+| `GET` | `/v1/:db/:coll/find` | Paginated scan with optional filter (query params) |
+| `POST` | `/v1/:db/:coll/find` | Paginated scan with filter as JSON body |
+| `GET` | `/v1/:db/:coll/tail` | Last N documents with optional filter (query params) |
+| `POST` | `/v1/:db/:coll/tail` | Last N documents with filter as JSON body |
 | `GET` | `/v1/:db/:coll/stats` | Document count, file size |
 
-#### `/find` parameters
+#### GET `/find` and `/tail` — query parameters
 
 | Param | Default | Description |
 |-------|---------|-------------|
 | `n` | `20` | Documents to return (1–100,000) |
-| `offset` | `0` | Documents to skip (counts only filter matches) |
+| `offset` | `0` | Documents to skip — `/find` only |
 | `where` | — | JSON field equality filter: `{"field":"value"}` |
 
-#### `/tail` parameters
+#### POST `/find` — JSON body
 
-| Param | Default | Description |
+Send the filter as a JSON document instead of URL-encoding it. Useful for complex filters, scripting, and saving queries to files.
+
+```json
+{ "filter": {"status": "active", "role": "admin"}, "n": 50, "offset": 0 }
+```
+
+| Field | Default | Description |
 |-------|---------|-------------|
+| `filter` | — | JSON object — field equality filter |
+| `n` | `20` | Documents to return (1–100,000) |
+| `offset` | `0` | Documents to skip |
+
+#### POST `/tail` — JSON body
+
+```json
+{ "filter": {"level": "error"}, "n": 100 }
+```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `filter` | — | JSON object — field equality filter |
 | `n` | `20` | Documents from the end (1–100,000) |
-| `where` | — | JSON field equality filter |
 
 ### Indexes
 
@@ -201,14 +243,29 @@ curl -X POST http://localhost:8000/v1/mydb/users/batch \
   -H 'Content-Type: application/json' \
   -d '[{"name":"Bob","role":"user"},{"name":"Carol","role":"admin"}]'
 
-# Filter by field value
+# Filter by field value (GET — URL-encoded)
 curl -g 'http://localhost:8000/v1/mydb/users/find?where={"role":"admin"}'
+
+# Filter by field value (POST — JSON body, no URL-encoding needed)
+curl -X POST http://localhost:8000/v1/mydb/users/find \
+  -H 'Content-Type: application/json' \
+  -d '{"filter":{"role":"admin"},"n":50}'
+
+# Save a query to a file and reuse it
+echo '{"filter":{"status":"active","role":"admin"},"n":100}' > query.json
+curl -X POST http://localhost:8000/v1/mydb/users/find \
+  -H 'Content-Type: application/json' -d @query.json
 
 # Paginate
 curl 'http://localhost:8000/v1/mydb/users/find?n=20&offset=40'
 
 # Last 10 documents
 curl 'http://localhost:8000/v1/mydb/users/tail?n=10'
+
+# Last 100 error-level events (POST)
+curl -X POST http://localhost:8000/v1/mydb/events/tail \
+  -H 'Content-Type: application/json' \
+  -d '{"filter":{"level":"error"},"n":100}'
 
 # Stats
 curl http://localhost:8000/v1/mydb/users/stats
