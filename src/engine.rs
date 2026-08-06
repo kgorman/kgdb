@@ -96,11 +96,15 @@ impl Engine {
         Ok(dir.join(format!("{coll}.ndjson")))
     }
 
-    fn sidecar_path(&self, db: &str, coll: &str) -> PathBuf {
-        self.root.join(db).join(format!("{coll}.index.json"))
+    /// Validates before joining: an unchecked `db`/`coll` here is a path traversal
+    /// primitive, since callers delete and overwrite the returned path.
+    fn sidecar_path(&self, db: &str, coll: &str) -> Result<PathBuf, EngineError> {
+        validate_name(db)?;
+        validate_name(coll)?;
+        Ok(self.root.join(db).join(format!("{coll}.index.json")))
     }
 
-    fn save_sidecar(&self, db: &str, coll: &str) -> io::Result<()> {
+    fn save_sidecar(&self, db: &str, coll: &str) -> Result<(), EngineError> {
         let key = (db.to_owned(), coll.to_owned());
         let mut fields: Vec<String> = if let Some(coll_indexes) = self.indexes.get(&key) {
             coll_indexes.iter().map(|e| e.key().clone()).collect()
@@ -108,7 +112,7 @@ impl Engine {
             vec![]
         };
         fields.sort();
-        let path = self.sidecar_path(db, coll);
+        let path = self.sidecar_path(db, coll)?;
         let json = serde_json::json!({ "fields": fields });
         let s = serde_json::to_string(&json)?;
         // Create parent dir if needed
@@ -120,7 +124,7 @@ impl Engine {
             match fs::remove_file(&path) {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e),
+                Err(e) => return Err(e.into()),
             }
         } else {
             fs::write(&path, s)?;
@@ -460,12 +464,14 @@ impl Engine {
     }
 
     pub fn drop_collection(&self, db: &str, coll: &str) -> Result<bool, EngineError> {
+        validate_name(db)?;
+        validate_name(coll)?;
         let key = (db.to_owned(), coll.to_owned());
         if let Some((_, h)) = self.handles.remove(&key) {
             let _ = h.lock().unwrap_or_else(|e| e.into_inner()).writer.flush();
         }
         self.indexes.remove(&key);
-        let sidecar = self.sidecar_path(db, coll);
+        let sidecar = self.sidecar_path(db, coll)?;
         match fs::remove_file(&sidecar) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}

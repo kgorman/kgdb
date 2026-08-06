@@ -80,12 +80,16 @@ struct AuthConfig {
 }
 
 impl AuthConfig {
+    /// True when no tokens are configured at all — the documented "auth disabled" mode.
+    fn disabled(&self) -> bool {
+        self.global.is_none() && self.per_db.is_empty()
+    }
+
     fn is_authorized(&self, provided: Option<&str>, db: Option<&str>) -> bool {
-        let global_required = self.global.is_some();
-        let db_required     = db.and_then(|d| self.per_db.get(d)).is_some();
-        if !global_required && !db_required {
-            return true; // no auth configured for this route
+        if self.disabled() {
+            return true;
         }
+        // Fail closed: once any token is configured, every protected route needs one.
         let Some(tok) = provided else { return false };
         if let Some(g) = &self.global {
             if ct_eq(tok.as_bytes(), g.as_bytes()) { return true; }
@@ -99,11 +103,40 @@ impl AuthConfig {
     }
 }
 
-/// Extract the database name from a URI path of the form /v1/{db}/...
-fn extract_db(path: &str) -> Option<&str> {
+/// Percent-decode a single path segment, matching what the `Path` extractor hands
+/// to handlers. Without this the auth check and the handler can see different
+/// database names (e.g. `/v1/%73ecret` vs `/v1/secret`).
+fn percent_decode(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' => {
+                let hex = s.get(i + 1..i + 3)?;
+                out.push(u8::from_str_radix(hex, 16).ok()?);
+                i += 3;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// Extract the decoded database name from a URI path of the form /v1/{db}/...
+///
+/// Returns `None` if the segment is absent, empty, or not decodable — callers must
+/// treat that as "no database matched", never as "no auth required".
+fn extract_db(path: &str) -> Option<String> {
     let rest = path.strip_prefix("/v1/")?;
     let db   = rest.split('/').next()?;
-    if db.is_empty() { None } else { Some(db) }
+    if db.is_empty() { return None; }
+    // A decoded '/' would mean the segment spans a route boundary; reject it.
+    let decoded = percent_decode(db)?;
+    if decoded.is_empty() || decoded.contains('/') { None } else { Some(decoded) }
 }
 
 async fn check_auth(auth: Arc<AuthConfig>, req: Request, next: Next) -> Response {
@@ -113,7 +146,7 @@ async fn check_auth(auth: Arc<AuthConfig>, req: Request, next: Next) -> Response
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
 
-    if !auth.is_authorized(provided, db) {
+    if !auth.is_authorized(provided, db.as_deref()) {
         return (StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))).into_response();
     }
     next.run(req).await
